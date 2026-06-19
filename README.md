@@ -1,6 +1,6 @@
 # TQNN DMM — Developer Integration Guide
 
-**Toridion Ltd · API v1.0.1**
+**Toridion Ltd · API v1.0.4**
 
 > Give this document to Claude or any LLM coding assistant and say: *"Using this guide, help me build a [Python/JavaScript/PHP] application that does X with TQNN DMM."* The document is self-contained — no other reference is needed.
 
@@ -182,31 +182,47 @@ PQR (Post-Quantum Resistant) hashing transforms every key and value in your JSON
 
 ### The Algorithm
 
+**Self-Salting PQR — V1.0.4+**
+
+The padding character is no longer a constant `*`. Instead, the salt is derived from the input itself via a first SHA-256 pass. This defeats rainbow table attacks entirely: the salt is endogenous to the input and unknowable without it.
+
 ```
-padTo16(s):
-    if len(s) >= 16  →  return s[:16]          (truncate to 16 chars)
-    else             →  return s.ljust(16, '*') (right-pad with '*')
+tqnn_token16(s):
+    input  = trim(s)
+    h1     = SHA-256(input)              # 64 hex chars — endogenous salt
+    mixed  = input + h1                  # append salt to input
+    padded = mixed[:16]                  # take first 16 chars
+    token  = SHA-256(padded)[:16]        # hash and truncate to 16-char token
+    return token
 
 For each key in a JSON object:
-    hashed_key = SHA-256( padTo16(key) )
+    hashed_key = tqnn_token16(key)
 
 For each leaf value:
     tokens = split(value, on whitespace and punctuation: /[\s,.;:]+/)
-    hashed_value = SHA-256( padTo16(token1) ) + "," + SHA-256( padTo16(token2) ) + ...
+    hashed_value = tqnn_token16(token1) + "," + tqnn_token16(token2) + ...
     (comma-separated, no spaces)
 
 For nested objects and arrays: recurse.
 ```
 
+**Why self-salting?**
+- Defeats rainbow tables — salt is derived from the input, unknowable without it
+- Lifts all inputs into the full 2^256 hash space regardless of entropy
+- 2^192 candidate inputs per stored 16-char token — reconstruction provably impossible
+- No external key material, zero storage overhead, fully deterministic
+
 **Example:** The record `{"name": "Aiden Liu", "fmt": "FHIR"}` becomes:
 ```json
 {
-  "<sha256 of 'name************'>": "<sha256 of 'Aiden***********'>,<sha256 of 'Liu*************'>",
-  "<sha256 of 'fmt*************'>": "<sha256 of 'FHIR************'>"
+  "<tqnn_token16('name')>": "<tqnn_token16('Aiden')>,<tqnn_token16('Liu')>",
+  "<tqnn_token16('fmt')>":  "<tqnn_token16('FHIR')>"
 }
 ```
 
 Note that `"Aiden Liu"` splits into two tokens — `Aiden` and `Liu` — each hashed independently. This is what enables searching for either word individually.
+
+> **Breaking change from V1.0.3:** The old constant `*` padding scheme produced different tokens. Any dataset ingested under V1.0.3 must be wiped and re-ingested using V1.0.4+ tooling.
 
 ### Python
 
@@ -218,9 +234,17 @@ import json
 def sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-def pad_to_16(s: str) -> str:
-    s = str(s)
-    return s[:16] if len(s) >= 16 else s.ljust(16, "*")
+def tqnn_token16(s: str) -> str:
+    """Self-salting PQR token — canonical implementation V1.0.4+."""
+    inp    = str(s).strip()
+    h1     = sha256(inp)              # endogenous salt
+    padded = (inp + h1)[:16]         # first 16 chars of input+salt
+    return sha256(padded)[:16]       # hash and truncate
+
+# SUPERSEDED V1.0.3 — constant-padding scheme:
+# def pad_to_16(s):
+#     s = str(s)
+#     return s[:16] if len(s) >= 16 else s.ljust(16, "*")
 
 def split_tokens(s: str) -> list:
     parts = re.split(r"[\s,\.;:]+", str(s))
@@ -233,17 +257,17 @@ def pqr_hash(obj):
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
-            hk = sha256(pad_to_16(str(k)))
+            hk = tqnn_token16(str(k))
             if isinstance(v, (dict, list)):
                 out[hk] = pqr_hash(v)
             else:
                 tokens = split_tokens(str(v)) or [""]
-                out[hk] = ",".join(sha256(pad_to_16(t)) for t in tokens)
+                out[hk] = ",".join(tqnn_token16(t) for t in tokens)
         return out
     if isinstance(obj, list):
         return [pqr_hash(item) for item in obj]
     tokens = split_tokens(str(obj)) or [""]
-    return ",".join(sha256(pad_to_16(t)) for t in tokens)
+    return ",".join(tqnn_token16(t) for t in tokens)
 ```
 
 ### JavaScript (browser — async Web Crypto)
@@ -256,10 +280,20 @@ async function sha256(msg) {
         .map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-function padTo16(s) {
-    const str = String(s);
-    return str.length >= 16 ? str.substring(0, 16) : str.padEnd(16, '*');
+// Self-salting PQR token — V1.0.4+
+// Mirrors PHP tqnnToken16() and Python tqnn_token16() exactly.
+async function tqnnToken16(s) {
+    const input  = String(s).trim();
+    const h1     = await sha256(input);       // endogenous salt
+    const padded = (input + h1).substring(0, 16);
+    return (await sha256(padded)).substring(0, 16);
 }
+
+// SUPERSEDED V1.0.3 — constant-padding scheme:
+// function padTo16(s) {
+//     const str = String(s);
+//     return str.length >= 16 ? str.substring(0, 16) : str.padEnd(16, '*');
+// }
 
 function splitTokens(s) {
     return String(s).split(/[\s,.;:]+/).filter(t => t.length > 0);
@@ -271,13 +305,13 @@ async function pqrHash(obj) {
     if (typeof obj === 'object') {
         const out = {};
         for (const [k, v] of Object.entries(obj)) {
-            const hk = await sha256(padTo16(k));
+            const hk = await tqnnToken16(k);
             if (typeof v === 'object' && v !== null) {
                 out[hk] = await pqrHash(v);
             } else {
                 const tokens = splitTokens(String(v));
                 const hashed = await Promise.all(
-                    (tokens.length ? tokens : ['']).map(t => sha256(padTo16(t)))
+                    (tokens.length ? tokens : ['']).map(t => tqnnToken16(t))
                 );
                 out[hk] = hashed.join(',');
             }
@@ -286,7 +320,7 @@ async function pqrHash(obj) {
     }
     const tokens = splitTokens(String(obj));
     const hashed = await Promise.all(
-        (tokens.length ? tokens : ['']).map(t => sha256(padTo16(t)))
+        (tokens.length ? tokens : ['']).map(t => tqnnToken16(t))
     );
     return hashed.join(',');
 }
@@ -374,7 +408,7 @@ Hash one word and call `searchDoc`. Get back a list of file references for docum
 ```python
 def search_one_token(base_url, api_key, api_secret, dataset, word):
     """Search for a single word. Returns list of file reference strings."""
-    pattern = sha256(pad_to_16(word))
+    pattern = tqnn_token16(word)   # Self-salting PQR — V1.0.4+
     body = urllib.parse.urlencode({
         "tqnnAPIKEY":      api_key,
         "tqnnAPISECRET":   api_secret,
@@ -482,16 +516,16 @@ The TQNN memory graph uses shared hub tokens (common substrings like `com`, `uk`
 ### How it works
 
 At ingest, store each document **twice** with the same `filereference`:
-1. **Forward store** — normal PQR hash: `sha256(pad_to_16(token))`
-2. **Reverse-input store** — token string reversed before hashing: `sha256(pad_to_16(token[::-1]))`
+1. **Forward store** — self-salting PQR token: `tqnn_token16(token)`
+2. **Reverse-input store** — token string reversed before self-salting: `tqnn_token16(token[::-1])`
 
 Note: reverse the **input string**, not the hash output.
 
 At search, for each token run **two** `searchDoc` calls:
-1. Forward: `sha256(pad_to_16(token))`
-2. Reverse: `sha256(pad_to_16(token[::-1]))`
+1. Forward: `tqnn_token16(token)`
+2. Reverse: `tqnn_token16(token[::-1])`
 
-AND the two result sets. Genuine matches appear in both (the record contains the token in both its forward and reverse-hashed form). False positives from hub token traversal do not survive both calls.
+AND the two result sets. Genuine matches appear in both. False positives from hub token traversal do not survive both calls.
 
 ### FPD specialcode
 
@@ -499,14 +533,14 @@ Because forward and reverse stores happen milliseconds apart, TQNN assigns them 
 
 ```python
 def fpd_specialcode(rec_id: str) -> str:
-    """Derive a stable 8-char code from the record ID. Zero extra cost."""
-    return "fpd_" + sha256(pad_to_16(str(rec_id)))[:8]
+    """Derive a stable 8-char code from the record ID. V1.0.4+ self-salting."""
+    return "fpd_" + tqnn_token16(str(rec_id))[:8]
 
 # Build file reference with FPD code
 rec_id = "REC-00010149"
-code   = fpd_specialcode(rec_id)   # → "fpd_ef99e90b"
+code   = fpd_specialcode(rec_id)   # → "fpd_XXXXXXXX" (self-salted)
 file_ref = f"records_0001.jsonl::line149::{rec_id}::{code}::"
-# → "records_0001.jsonl::line149::REC-00010149::fpd_ef99e90b::"
+# → "records_0001.jsonl::line149::REC-00010149::fpd_XXXXXXXX::"
 ```
 
 Both the forward and reverse `storeDoc` calls use this **identical fileReference**.
@@ -516,25 +550,25 @@ Both the forward and reverse `storeDoc` calls use this **identical fileReference
 ```python
 def pqr_hash_reversed(obj):
     """
-    Same as pqr_hash but every token string is reversed BEFORE pad_to_16 + sha256.
-    Reverse the INPUT string — not the hash output.
+    Same as pqr_hash but every token string is reversed BEFORE tqnn_token16.
+    Reverse the INPUT string — not the hash output. V1.0.4+ self-salting.
     """
     if obj is None:
         return None
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
-            hk = sha256(pad_to_16(str(k)[::-1]))
+            hk = tqnn_token16(str(k)[::-1])
             if isinstance(v, (dict, list)):
                 out[hk] = pqr_hash_reversed(v)
             else:
                 tokens = split_tokens(str(v)) or [""]
-                out[hk] = ",".join(sha256(pad_to_16(t[::-1])) for t in tokens)
+                out[hk] = ",".join(tqnn_token16(t[::-1]) for t in tokens)
         return out
     if isinstance(obj, list):
         return [pqr_hash_reversed(item) for item in obj]
     tokens = split_tokens(str(obj)) or [""]
-    return ",".join(sha256(pad_to_16(t[::-1])) for t in tokens)
+    return ",".join(tqnn_token16(t[::-1]) for t in tokens)
 ```
 
 ### FPD ingest (Python)
@@ -608,8 +642,8 @@ def search_phrase_fpd(base_url, api_key, api_secret, dataset, phrase):
 
     master = None
     for token in tokens:
-        fwd_set = search_raw(sha256(pad_to_16(token)))
-        rev_set = search_raw(sha256(pad_to_16(token[::-1])))
+        fwd_set = search_raw(tqnn_token16(token))           # V1.0.4+ self-salting
+        rev_set = search_raw(tqnn_token16(token[::-1]))     # reverse input
         token_set = fwd_set & rev_set       # FPD: must appear in both
         master = token_set if master is None else master & token_set
         if not master:
@@ -838,7 +872,7 @@ Without it, TQNN's appended timestamp fuses with your record ID: `REC-0004200178
 If a corpus was ingested without the reverse-input double-store, enabling FPD at search will drop genuine matches. The two must be consistent.
 
 **5. One token per searchDoc call**
-Never send `sha256(padTo16("Aiden")) + "," + sha256(padTo16("Liu"))` as a single pattern. Each token is one call. The comma-separated format is only used inside stored document patterns to represent multi-token field values.
+Never send `tqnn_token16("Aiden") + "," + tqnn_token16("Liu")` as a single pattern. Each token is one call. The comma-separated format is only used inside stored document patterns to represent multi-token field values.
 
 **6. SSL verification on local appliances**
 Use `ssl._create_unverified_context()` for `tqnn.local` with self-signed certificates. Remove this for production deployments with valid certificates.
@@ -851,11 +885,11 @@ Different datasets are isolated from each other. Searching `dataset=demoapp` wil
 ## Quick Checklist for a New Integration
 
 - [ ] Split combined credential token at position 37 to get `api_key` and `api_secret`
-- [ ] Implement `sha256`, `pad_to_16`, `split_tokens`, `pqr_hash`
+- [ ] Implement `sha256`, `tqnn_token16`, `split_tokens`, `pqr_hash`
 - [ ] Design `fileReference` with `::` delimiters and a trailing `::`
 - [ ] Hash every record with `pqr_hash` before calling `storeDoc`
 - [ ] If using FPD: also implement `pqr_hash_reversed` and `fpd_specialcode`; call `storeDoc` twice per record with the same fileReference
-- [ ] For search: hash one word at a time with `sha256(pad_to_16(word))`
+- [ ] For search: hash one word at a time with `tqnn_token16(word)`
 - [ ] For multi-word search: one `searchDoc` call per word, AND the result sets
 - [ ] Strip TQNN timestamp before set operations: `ref.rsplit("::", 1)[0]`
 - [ ] For FPD search: per token, also run reverse hash search and intersect before ANDing across tokens
