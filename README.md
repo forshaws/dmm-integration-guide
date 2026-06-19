@@ -184,7 +184,7 @@ PQR (Post-Quantum Resistant) hashing transforms every key and value in your JSON
 
 **Self-Salting PQR — V1.0.4+**
 
-The padding character is no longer a constant `*`. Instead, the salt is derived from the input itself via a first SHA-256 pass. This defeats rainbow table attacks entirely: the salt is endogenous to the input and unknowable without it.
+The salt is derived from the input itself via a first SHA-256 pass — endogenous to the input and unknowable without it. This defeats rainbow table attacks entirely.
 
 ```
 tqnn_token16(s):
@@ -222,8 +222,6 @@ For nested objects and arrays: recurse.
 
 Note that `"Aiden Liu"` splits into two tokens — `Aiden` and `Liu` — each hashed independently. This is what enables searching for either word individually.
 
-> **Breaking change from V1.0.3:** The old constant `*` padding scheme produced different tokens. Any dataset ingested under V1.0.3 must be wiped and re-ingested using V1.0.4+ tooling.
-
 ### Python
 
 ```python
@@ -240,11 +238,6 @@ def tqnn_token16(s: str) -> str:
     h1     = sha256(inp)              # endogenous salt
     padded = (inp + h1)[:16]         # first 16 chars of input+salt
     return sha256(padded)[:16]       # hash and truncate
-
-# SUPERSEDED V1.0.3 — constant-padding scheme:
-# def pad_to_16(s):
-#     s = str(s)
-#     return s[:16] if len(s) >= 16 else s.ljust(16, "*")
 
 def split_tokens(s: str) -> list:
     parts = re.split(r"[\s,\.;:]+", str(s))
@@ -288,12 +281,6 @@ async function tqnnToken16(s) {
     const padded = (input + h1).substring(0, 16);
     return (await sha256(padded)).substring(0, 16);
 }
-
-// SUPERSEDED V1.0.3 — constant-padding scheme:
-// function padTo16(s) {
-//     const str = String(s);
-//     return str.length >= 16 ? str.substring(0, 16) : str.padEnd(16, '*');
-// }
 
 function splitTokens(s) {
     return String(s).split(/[\s,.;:]+/).filter(t => t.length > 0);
