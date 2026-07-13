@@ -22,6 +22,7 @@ TQNN DMM (Document Meta Memory) is a sovereign AI memory appliance. It stores JS
 - There are five endpoints: `authID`, `registerID`, `storePattern`, `storeDoc`, `searchDoc`.
 - For most applications you will only use `storeDoc` and `searchDoc`.
 - The `pattern` field in every call is a JSON string of SHA-256 hashed values — never plaintext.
+- **PQR hashing is entirely client-side.** The appliance never receives plaintext and never computes a hash itself — it only stores and matches whatever already-hashed `pattern` string your client sends. This means the appliance has no concept of "PQR version": hashing is purely a convention your client must implement consistently between store and search. See [The PQR Hash](#the-pqr-hash-the-most-important-concept) below for the current canonical algorithm.
 
 ---
 
@@ -174,7 +175,7 @@ Searches the TQNN graph for documents matching a hashed pattern. Returns file re
 
 ---
 
-## The PQR Hash — The Most Important Concept
+## The PQR Hash: The Most Important Concept
 
 **Everything stored in the DMM must be PQR-hashed. Searches must hash the query identically. If the hash doesn't match, nothing is found.**
 
@@ -182,7 +183,9 @@ PQR (Post-Quantum Resistant) hashing transforms every key and value in your JSON
 
 ### The Algorithm
 
-**Self-Salting PQR — V1.0.4+**
+**Self-Salting PQR — V1.3.0+**
+
+> This version number tracks the **client-side hashing convention**, not the appliance's API version (`API v1.0.4` at the top of this document). The appliance is hash-agnostic — it just stores/matches opaque pattern strings — so "PQR version" only ever describes which algorithm *your* client used. If you're integrating against a corpus ingested by another client (the Workbench, `dmm-mcp-server`, or an older custom integration), confirm it used this same V1.3.0+ scheme; a mismatch means store and search will silently never match, with no error from the appliance to tell you why.
 
 The salt is derived from the input itself via a first SHA-256 pass — endogenous to the input and unknowable without it. This defeats rainbow table attacks entirely.
 
@@ -233,7 +236,7 @@ def sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 def tqnn_token16(s: str) -> str:
-    """Self-salting PQR token — canonical implementation V1.0.4+."""
+    """Self-salting PQR token — canonical implementation V1.3.0+."""
     inp    = str(s).strip()
     h1     = sha256(inp)              # endogenous salt
     padded = (inp + h1)[:16]         # first 16 chars of input+salt
@@ -273,7 +276,7 @@ async function sha256(msg) {
         .map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// Self-salting PQR token — V1.0.4+
+// Self-salting PQR token — V1.3.0+
 // Mirrors PHP tqnnToken16() and Python tqnn_token16() exactly.
 async function tqnnToken16(s) {
     const input  = String(s).trim();
@@ -395,7 +398,7 @@ Hash one word and call `searchDoc`. Get back a list of file references for docum
 ```python
 def search_one_token(base_url, api_key, api_secret, dataset, word):
     """Search for a single word. Returns list of file reference strings."""
-    pattern = tqnn_token16(word)   # Self-salting PQR — V1.0.4+
+    pattern = tqnn_token16(word)   # Self-salting PQR — V1.3.0+
     body = urllib.parse.urlencode({
         "tqnnAPIKEY":      api_key,
         "tqnnAPISECRET":   api_secret,
@@ -464,6 +467,8 @@ stable = ref.rsplit("::", 1)[0]
 # "records.jsonl::line3::REC-003::fpd_abc123"
 ```
 
+> **Note:** `rsplit("::", 1)[0]` always strips whatever follows the last `::`, regardless of whether it's actually a timestamp. This is fine for every reference the appliance actually returns to you, since the last segment is always the appended timestamp. If you're writing code that also has to handle hand-built or third-party file references that might *not* end in a real timestamp, use a stricter check instead — only strip when the trailing segment is all-digits: `re.sub(r"::\d+$", "", ref)`. This is what `dmm-mcp-server`'s resolver layer does internally (see [See Also](#see-also-content-resolution-and-mcp-tools)), so matching it here avoids subtly different stripping behaviour between your own code and anything built on the resolver.
+
 ---
 
 ## fileReference Design
@@ -520,7 +525,7 @@ Because forward and reverse stores happen milliseconds apart, TQNN assigns them 
 
 ```python
 def fpd_specialcode(rec_id: str) -> str:
-    """Derive a stable 8-char code from the record ID. V1.0.4+ self-salting."""
+    """Derive a stable 8-char code from the record ID. V1.3.0+ self-salting."""
     return "fpd_" + tqnn_token16(str(rec_id))[:8]
 
 # Build file reference with FPD code
@@ -538,7 +543,7 @@ Both the forward and reverse `storeDoc` calls use this **identical fileReference
 def pqr_hash_reversed(obj):
     """
     Same as pqr_hash but every token string is reversed BEFORE tqnn_token16.
-    Reverse the INPUT string — not the hash output. V1.0.4+ self-salting.
+    Reverse the INPUT string — not the hash output. V1.3.0+ self-salting.
     """
     if obj is None:
         return None
@@ -629,7 +634,7 @@ def search_phrase_fpd(base_url, api_key, api_secret, dataset, phrase):
 
     master = None
     for token in tokens:
-        fwd_set = search_raw(tqnn_token16(token))           # V1.0.4+ self-salting
+        fwd_set = search_raw(tqnn_token16(token))           # V1.3.0+ self-salting
         rev_set = search_raw(tqnn_token16(token[::-1]))     # reverse input
         token_set = fwd_set & rev_set       # FPD: must appear in both
         master = token_set if master is None else master & token_set
@@ -881,6 +886,20 @@ Different datasets are isolated from each other. Searching `dataset=demoapp` wil
 - [ ] Strip TQNN timestamp before set operations: `ref.rsplit("::", 1)[0]`
 - [ ] For FPD search: per token, also run reverse hash search and intersect before ANDing across tokens
 - [ ] Use `return_filelist=1` on `searchDoc` to get file references back
+
+---
+
+## See Also: Content Resolution and MCP Tools
+
+Everything above gets you `storeDoc`/`searchDoc` file references — stable identifiers, but *your* application is responsible for turning a file reference back into actual content (typically your own database lookup by `record_id`).
+
+If you'd rather not build and maintain that lookup layer yourself, or you want Claude (or another MCP-compatible LLM) to call DMM directly as a tool rather than going through your own API, Toridion also ships **`dmm-mcp-server`** — an MCP server that wraps this same appliance and adds:
+
+- A **resolver layer** (`tqnn_get`) that maps a file reference's namespace prefix (e.g. `records_`, `invoices_`) to wherever that content actually lives — local file, S3, SharePoint, cold storage, or a custom handler you write — so file references resolve to real content without you hand-rolling the lookup.
+- MCP tools (`tqnn_search`, `tqnn_similarity`, `tqnn_store`, `tqnn_get`) that let Claude call DMM directly during a conversation, including IDF-weighted similarity search on top of the raw token matching this guide covers.
+- OAuth 2.1 auth for exposing DMM to claude.ai as a remote connector, with optional per-employee accounts and per-employee DMM sub-credentials.
+
+The two are complementary, not competing: `dmm-mcp-server` calls the exact same `storeDoc`/`searchDoc` endpoints documented above, using the same PQR hashing — it just adds the content-resolution and LLM-tool-calling layers on top. See the `dmm-mcp-server` repo's README and `docs/resolvers.md` for details.
 
 ---
 
