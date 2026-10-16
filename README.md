@@ -1,8 +1,8 @@
 # TQNN DMM — Developer Integration Guide
 
-**Toridion Ltd · API v1.0.4**
+**Toridion Ltd · API v1.1.5**
 
-> Give this document to Claude or any LLM coding assistant and say: *"Using this guide, help me build a [Python/JavaScript/PHP] application that does X with TQNN DMM."* The document is self-contained — no other reference is needed.
+> **For coding agents and the developers working with them.** Give this guide to Claude or any LLM coding assistant, together with the `dmm-mcp-server` repository and its README, and say: *"Using this guide and the dmm-mcp-server README, build a [Python/JavaScript/PHP] script that does X with TQNN DMM."* This guide covers the REST API and client-side encoding. The MCP README covers the MCP tools, configuration and resolvers.
 
 ---
 
@@ -11,18 +11,19 @@
 TQNN DMM (Document Meta Memory) is a sovereign AI memory appliance. It stores JSON metadata as a neural associative memory graph and enables probabilistic O(1) search across all stored associations — without SQL, schemas, or indexes.
 
 **The mental model:**
-- You **store** a document by hashing its metadata fields and indexing them into the DMM graph.
-- You **search** by hashing a plain-text query term and asking the DMM which documents contain that pattern.
+- You **store** a document by sending its JSON metadata (plain, or hashed client-side) with a file reference you choose.
+- You **search** by sending one query term, encoded the same way as the stored data, and asking the DMM which documents contain it.
 - The DMM returns a list of **file references** — the identifiers you assigned at store time.
-- You never store raw data values. Everything is SHA-256 hashed before it reaches the appliance. The original values cannot be recovered from the DMM.
+- The appliance stores tokens and file references, not documents. Your application (or the MCP resolver layer) turns a file reference back into content.
 
 **Key facts for developers:**
-- All API calls are `multipart/form-data` POST requests.
+- All API calls are form-encoded POST requests (`application/x-www-form-urlencoded` or `multipart/form-data`).
 - Authentication is two fields on every call: `tqnnAPIKEY` and `tqnnAPISECRET`.
-- There are five endpoints: `authID`, `registerID`, `storePattern`, `storeDoc`, `searchDoc`.
-- For most applications you will only use `storeDoc` and `searchDoc`.
-- The `pattern` field in every call is a JSON string of SHA-256 hashed values — never plaintext.
-- **PQR hashing is entirely client-side.** The appliance never receives plaintext and never computes a hash itself — it only stores and matches whatever already-hashed `pattern` string your client sends. This means the appliance has no concept of "PQR version": hashing is purely a convention your client must implement consistently between store and search. See [The PQR Hash](#the-pqr-hash-the-most-important-concept) below for the current canonical algorithm.
+- Endpoints: `storeDoc`, `searchDoc`, `removeDoc`, `discoverDatasets`, `storePattern`, `searchPattern`, `authID`, `registerID`.
+- For most applications you will use `storeDoc`, `searchDoc` and `removeDoc`.
+- The `pattern` field is a JSON string of document metadata. It can be plain JSON, or hashed client-side (PQR, optionally HMAC-keyed). See [Protection Tiers](#protection-tiers).
+- **Hashing is optional and entirely client-side.** The appliance accepts plain, PQR-hashed and HMAC-keyed patterns identically and has no setting for which was used. Store and search must use the same method — see [Protection Tiers](#protection-tiers).
+- Matching is **case-sensitive**: `Gupta` and `gupta` are different tokens.
 
 ---
 
@@ -58,6 +59,7 @@ Authenticates a username/password credential pair against the TQNN graph.
 | `tqnnAPISECRET` | yes | API secret |
 | `username` | yes | Username to authenticate |
 | `password` | yes | Password to authenticate |
+| `credential2`–`credential9` | no | Additional credential factors. Supply to require them at auth time |
 | `multihash` | no | Integer. Enable multi-hash of credential pair for higher security |
 | `returnauthtoken` | no | Integer. Set to `1` to receive an authentication token in the response |
 | `dataset` | no | Target dataset/bucket name |
@@ -100,6 +102,20 @@ Stores a raw pattern string directly into the TQNN graph. Low-level — no docum
 
 ---
 
+### POST /v1/searchPattern
+
+Searches for a raw pattern string. Low-level counterpart to `storePattern`.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `tqnnAPIKEY` | yes | API key |
+| `tqnnAPISECRET` | yes | API secret |
+| `pattern` | yes | A pattern string to search for |
+| `return_filelist` | no | Set to `1` to include matched file references in the response |
+| `dataset` | no | Target dataset/bucket name |
+
+---
+
 ### POST /v1/storeDoc
 
 Indexes a document's metadata into the TQNN graph, associated with a file reference you provide. This is the primary ingestion endpoint.
@@ -109,8 +125,10 @@ Indexes a document's metadata into the TQNN graph, associated with a file refere
 | `tqnnAPIKEY` | yes | API key |
 | `tqnnAPISECRET` | yes | API secret |
 | `filereference` | yes | Your stable identifier for this document (see fileReference design below) |
-| `pattern` | yes | JSON string of PQR-hashed document metadata (see PQR Hash section) |
+| `pattern` | yes | JSON string of document metadata, plain or hashed (see [Protection Tiers](#protection-tiers)) |
 | `dataset` | no | Target dataset/bucket name (default: `demoapp`) |
+| `user_request_id` | no | Caller-supplied request identifier, echoed back in the response |
+| `create_ots` | no | Set to `1` to fingerprint the stored document (SHA-256) and submit it to the OpenTimestamps Bitcoin calendar pool. Response includes `ots_finger` |
 
 **Success response:**
 ```json
@@ -132,7 +150,7 @@ Searches the TQNN graph for documents matching a hashed pattern. Returns file re
 |-------|----------|-------------|
 | `tqnnAPIKEY` | yes | API key |
 | `tqnnAPISECRET` | yes | API secret |
-| `pattern` | yes | PQR-hashed search token — **one token per call** (see Search section) |
+| `pattern` | yes | Search token, encoded the same way as the stored data (plain word, PQR or HMAC token) — **one token per call** (see Search section) |
 | `return_filelist` | no | Set to `1` to include matched file references in the response |
 | `dataset` | no | Target dataset/bucket name |
 
@@ -175,9 +193,58 @@ Searches the TQNN graph for documents matching a hashed pattern. Returns file re
 
 ---
 
-## The PQR Hash: The Most Important Concept
+### POST /v1/removeDoc
 
-**Everything stored in the DMM must be PQR-hashed. Searches must hash the query identically. If the hash doesn't match, nothing is found.**
+Removes every entry linked to a file reference. Synchronous. Requires WRITE permission on the dataset.
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `tqnnAPIKEY` | yes | API key |
+| `tqnnAPISECRET` | yes | API secret |
+| `filereference` | yes | The file reference to remove, as you stored it (with the trailing `::`, without the appended timestamp) |
+| `dataset` | no | Target dataset/bucket name |
+| `user_request_id` | no | Caller-supplied request identifier, echoed back in the response |
+
+**Success:** `tqnn_response` is `REMOVE_OK`, with `lines_removed`, `tuples_deleted` and `buckets_scanned`. A file reference with no entries returns `NOT_FOUND`.
+
+**Errors:** HTTP 400 `MISSING_REQUIRED_PARAMETER: filereference` · 401 `AUTHENTICATION_ERROR` · 403 `DATASET_ACCESS_DENIED` (no WRITE permission on the dataset).
+
+**To update a document:** `removeDoc` the old file reference, then `storeDoc` the new data.
+
+---
+
+### POST /v1/discoverDatasets
+
+Lists the datasets your credentials can access. Fields: `tqnnAPIKEY`, `tqnnAPISECRET`.
+
+| Response field | Description |
+|----------------|-------------|
+| `scope` | `owner` (all datasets in the namespace) or `sub_credential` (the ACL whitelist) |
+| `permissions` | Permissions held, e.g. `READ`, `WRITE` |
+| `datasets` / `dataset_count` | Accessible datasets |
+| `default_dataset` | Set only when exactly one dataset is whitelisted |
+| `tqnn_response` | `OK`. HTTP 401 = `INVALID_API_KEY` |
+
+---
+
+## Protection Tiers
+
+The encoding of `pattern` is a client choice. Use one method per dataset, for every store and every search.
+
+| Tier | `storeDoc` pattern | `searchDoc` pattern |
+|------|--------------------|---------------------|
+| **Plain** | The JSON record as-is | The plain word |
+| **PQR** | `pqr_hash(record)` | `tqnn_token16(word)` |
+| **PQR + HMAC** | `pqr_hash(record)` with `PQR_KEY` set | `tqnn_token16(word)` with `PQR_KEY` set |
+
+- Plain: send `json.dumps(record)` instead of `json.dumps(pqr_hash(record))`, and search with the plain word. Skip the hashing sections below.
+- The appliance cannot tell which tier was used. A mismatch between store and search (tier, HMAC key or FPD) returns `NO_MATCH` with no error.
+- The appliance tokenises and hashes every field name and word in a stored pattern itself. Client-side hashing is an additional layer.
+- On `searchDoc`, plain terms are reduced to letters, digits and underscore. Terms containing other characters (e.g. hyphens) cannot be matched in Plain; use PQR or HMAC.
+
+---
+
+## PQR Hashing (Optional Client-Side Layer)
 
 PQR (Post-Quantum Resistant) hashing transforms every key and value in your JSON into SHA-256 hashes before sending to the appliance. The algorithm is deterministic — the same input always produces the same hash — which is what makes search work.
 
@@ -185,9 +252,9 @@ PQR (Post-Quantum Resistant) hashing transforms every key and value in your JSON
 
 **Self-Salting PQR — V1.3.0+**
 
-> This version number tracks the **client-side hashing convention**, not the appliance's API version (`API v1.0.4` at the top of this document). The appliance is hash-agnostic — it just stores/matches opaque pattern strings — so "PQR version" only ever describes which algorithm *your* client used. If you're integrating against a corpus ingested by another client (the Workbench, `dmm-mcp-server`, or an older custom integration), confirm it used this same V1.3.0+ scheme; a mismatch means store and search will silently never match, with no error from the appliance to tell you why.
+> This version number tracks the **client-side hashing convention**, not the appliance's API version (`API v1.1.5` at the top of this document). The appliance is hash-agnostic — it just stores/matches opaque pattern strings — so "PQR version" only ever describes which algorithm *your* client used. If you're integrating against a corpus ingested by another client (the Workbench, `dmm-mcp-server`, or an older custom integration), confirm it used this same V1.3.0+ scheme; a mismatch means store and search will silently never match, with no error from the appliance to tell you why.
 
-The salt is derived from the input itself via a first SHA-256 pass — endogenous to the input and unknowable without it. This defeats rainbow table attacks entirely.
+The salt is derived from the input itself via a first SHA-256 pass, so no precomputed table covers it. Tokens are a deterministic function of the plaintext: anyone who can guess a term can compute its token. For tokens that cannot be computed without a secret, use HMAC (below).
 
 ```
 tqnn_token16(s):
@@ -209,11 +276,23 @@ For each leaf value:
 For nested objects and arrays: recurse.
 ```
 
-**Why self-salting?**
-- Defeats rainbow tables — salt is derived from the input, unknowable without it
-- Lifts all inputs into the full 2^256 hash space regardless of entropy
-- 2^192 candidate inputs per stored 16-char token — reconstruction provably impossible
-- No external key material, zero storage overhead, fully deterministic
+### HMAC (optional keyed layer)
+
+Setting `PQR_KEY` makes `tqnn_token16` keyed. Tokens cannot then be computed without the key.
+
+```
+tqnn_token16(s, key):
+    input  = trim(s)
+    h1     = HMAC-SHA256(key, input)          # hex
+    padded = (input + h1)[:16]
+    token  = HMAC-SHA256(key, padded)[:16]    # hex, truncated
+```
+
+- The key is a string of at least 32 characters, used as a literal UTF-8 string (not base64-decoded). Generate once: `node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"`
+- The key stays on the client. It is never sent to the appliance.
+- Use the same key for every store and search on the dataset. Changing the key requires re-ingesting the data. Losing it makes the data unsearchable.
+- `dmm-mcp-server` reads the key from `TQNN_PQR_KEY`. DMM Workbench stores it in the connection field `pqrKey`.
+- `tqnn_token16`, `pqr_hash` and `pqr_hash_reversed` below use HMAC automatically when `PQR_KEY` is set.
 
 **Example:** The record `{"name": "Aiden Liu", "fmt": "FHIR"}` becomes:
 ```json
@@ -229,15 +308,23 @@ Note that `"Aiden Liu"` splits into two tokens — `Aiden` and `Liu` — each ha
 
 ```python
 import hashlib
+import hmac
 import re
 import json
+
+PQR_KEY = None   # set to a string of 32+ chars to enable HMAC (keyed) tokens
 
 def sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 def tqnn_token16(s: str) -> str:
     """Self-salting PQR token — canonical implementation V1.3.0+."""
-    inp    = str(s).strip()
+    inp = str(s).strip()
+    if PQR_KEY:                       # HMAC mode
+        k      = PQR_KEY.encode("utf-8")
+        h1     = hmac.new(k, inp.encode("utf-8"), hashlib.sha256).hexdigest()
+        padded = (inp + h1)[:16]
+        return hmac.new(k, padded.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
     h1     = sha256(inp)              # endogenous salt
     padded = (inp + h1)[:16]         # first 16 chars of input+salt
     return sha256(padded)[:16]       # hash and truncate
@@ -276,10 +363,26 @@ async function sha256(msg) {
         .map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+let PQR_KEY = null;   // set to a string of 32+ chars to enable HMAC (keyed) tokens
+
+async function hmacHex(key, msg) {
+    const enc = new TextEncoder();
+    const k   = await crypto.subtle.importKey('raw', enc.encode(key),
+                    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const sig = await crypto.subtle.sign('HMAC', k, enc.encode(msg));
+    return Array.from(new Uint8Array(sig))
+        .map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
 // Self-salting PQR token — V1.3.0+
 // Mirrors PHP tqnnToken16() and Python tqnn_token16() exactly.
 async function tqnnToken16(s) {
     const input  = String(s).trim();
+    if (PQR_KEY) {                            // HMAC mode
+        const hh     = await hmacHex(PQR_KEY, input);
+        const padded = (input + hh).substring(0, 16);
+        return (await hmacHex(PQR_KEY, padded)).substring(0, 16);
+    }
     const h1     = await sha256(input);       // endogenous salt
     const padded = (input + h1).substring(0, 16);
     return (await sha256(padded)).substring(0, 16);
@@ -389,6 +492,49 @@ async function storeDoc(baseUrl, apiKey, apiSecret, dataset, fileRef, record) {
 
 ---
 
+## Removing a Document
+
+```python
+import urllib.error
+
+def remove_doc(base_url, api_key, api_secret, dataset, file_ref):
+    """Remove every entry linked to file_ref (as stored, with trailing ::). Returns the response dict."""
+    body = urllib.parse.urlencode({
+        "tqnnAPIKEY":    api_key,
+        "tqnnAPISECRET": api_secret,
+        "filereference": file_ref,
+        "dataset":       dataset,
+    }).encode("utf-8")
+    ctx = ssl._create_unverified_context()
+    req = urllib.request.Request(
+        f"{base_url}/v1/removeDoc", data=body, method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
+    try:
+        with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return json.loads(e.read())    # 400 / 401 / 403 carry a JSON body
+
+# Update a record: remove, then store again
+remove_doc(base_url, key, secret, dataset, file_ref)
+store_doc(base_url, key, secret, dataset, file_ref, new_record)
+```
+
+```javascript
+async function removeDoc(baseUrl, apiKey, apiSecret, dataset, fileRef) {
+    const fd = new FormData();
+    fd.append('tqnnAPIKEY',    apiKey);
+    fd.append('tqnnAPISECRET', apiSecret);
+    fd.append('filereference', fileRef);
+    fd.append('dataset',       dataset);
+    const res = await fetch(`${baseUrl}/v1/removeDoc`, { method: 'POST', body: fd });
+    return res.json();   // success and 400/401/403 both return JSON
+}
+```
+
+---
+
 ## Searching
 
 ### Single-token search
@@ -467,7 +613,7 @@ stable = ref.rsplit("::", 1)[0]
 # "records.jsonl::line3::REC-003::fpd_abc123"
 ```
 
-> **Note:** `rsplit("::", 1)[0]` always strips whatever follows the last `::`, regardless of whether it's actually a timestamp. This is fine for every reference the appliance actually returns to you, since the last segment is always the appended timestamp. If you're writing code that also has to handle hand-built or third-party file references that might *not* end in a real timestamp, use a stricter check instead — only strip when the trailing segment is all-digits: `re.sub(r"::\d+$", "", ref)`. This is what `dmm-mcp-server`'s resolver layer does internally (see [See Also](#see-also-content-resolution-and-mcp-tools)), so matching it here avoids subtly different stripping behaviour between your own code and anything built on the resolver.
+> **Note:** `rsplit("::", 1)[0]` always strips whatever follows the last `::`, regardless of whether it's actually a timestamp. This is fine for every reference the appliance actually returns to you, since the last segment is always the appended timestamp. If you're writing code that also has to handle hand-built or third-party file references that might *not* end in a real timestamp, use a stricter check instead — only strip when the trailing segment is all-digits: `re.sub(r"::\d+$", "", ref)`.
 
 ---
 
@@ -484,12 +630,14 @@ The `filereference` is the handle returned in search results. Design it to carry
 - Always end with `::` — TQNN appends its own Unix timestamp after the last `::`. Without the trailing `::` the timestamp fuses with your record ID, corrupting the reference.
 - Use `::` as the delimiter throughout so segments are easy to split on.
 - Keep it URL-safe — no spaces or special characters.
+- To resolve references with `dmm-mcp-server`'s `tqnn_get`, begin with a namespace of letters/digits followed by `_` (e.g. `records_`, `invoices_`). Anything else goes to the `*` catch-all resolver.
+- File references are stored and returned unhashed. Use opaque IDs; never include names, ID numbers or other personal data.
 
 **Examples:**
 ```
-invoices.jsonl::line42::INV-00042::
-patient_records.jsonl::line149::REC-00010149::
-documents/2024/q3::doc_0091::
+invoices_2024.jsonl::line42::INV-00042::
+records_0001.jsonl::line149::REC-00010149::
+reports_q3::doc_0091::
 ```
 
 When using FPD (see below), include the specialcode segment before the trailing `::`:
@@ -648,7 +796,7 @@ def search_phrase_fpd(base_url, api_key, api_secret, dataset, phrase):
 
 ## Bulk Ingest from JSONL
 
-For ingesting large files, use a persistent HTTP connection and a thread pool. The appliance processes requests synchronously — threading improves throughput proportionally up to the appliance's CPU ceiling (4 threads is a safe default on a Raspberry Pi 5).
+For ingesting large files, use a persistent HTTP connection and a thread pool. The appliance processes requests synchronously — threading improves throughput proportionally up to the appliance's CPU ceiling (4 threads is a safe default on a Raspberry Pi 5; `storeDoc` throughput plateaus at approximately 16 threads and `searchDoc` scales to approximately 64).
 
 ```python
 import http.client
@@ -849,6 +997,20 @@ def authenticate_user(base_url, api_key, api_secret, username, password, dataset
 
 ---
 
+## Security Best Practice
+
+Hashing and HMAC run on the client. The appliance never receives the HMAC key.
+
+- **Plain** — the appliance hashes every stored word and field name itself. Use when index contents are not sensitive.
+- **PQR** — adds a client-side hash. Tokens are a deterministic function of the plaintext, so anyone who can guess a term can compute its token.
+- **PQR + HMAC** — tokens cannot be computed without the key. Use for sensitive datasets and for guessable values (names, ID numbers, dates).
+- **File references are not hashed.** Use opaque IDs; look the record up in your system of record.
+- Keep the HMAC key (`PQR_KEY` / `TQNN_PQR_KEY`) and API credentials in environment variables or a secret store. Do not commit, log or transmit the HMAC key.
+- Use sub-credentials with the minimum dataset permissions (READ for search-only clients).
+- Verify TLS in production. `ssl._create_unverified_context()` is for self-signed local appliances only.
+
+---
+
 ## Gotchas — Read These Before You Start
 
 **1. Multi-word values become multiple search tokens**
@@ -872,20 +1034,31 @@ Use `ssl._create_unverified_context()` for `tqnn.local` with self-signed certifi
 **7. dataset is a bucket**
 Different datasets are isolated from each other. Searching `dataset=demoapp` will not find records stored in `dataset=production`. Always specify the correct dataset.
 
+**8. Matching is case-sensitive**
+`Gupta` and `gupta` produce different tokens. Use the same casing at store and search.
+
+**9. Tokenisation**
+Stored values split on whitespace, `,`, `.`, `;` and `:`. Other characters (`-`, `@`, `/`) stay inside the token. Use the same split on the search side.
+
+**10. Error responses carry a JSON body**
+400 / 401 / 403 return JSON. With `urllib`, read it from `HTTPError.read()`.
+
 ---
 
 ## Quick Checklist for a New Integration
 
 - [ ] Split combined credential token at position 37 to get `api_key` and `api_secret`
-- [ ] Implement `sha256`, `tqnn_token16`, `split_tokens`, `pqr_hash`
+- [ ] Choose a protection tier (Plain, PQR, PQR + HMAC) and use it for every store and search
+- [ ] If hashing: implement `sha256`, `tqnn_token16`, `split_tokens`, `pqr_hash`. For HMAC also set `PQR_KEY` (32+ chars, client-side only)
 - [ ] Design `fileReference` with `::` delimiters and a trailing `::`
-- [ ] Hash every record with `pqr_hash` before calling `storeDoc`
+- [ ] Encode each record per your tier (`pqr_hash` for PQR / HMAC) before calling `storeDoc`
 - [ ] If using FPD: also implement `pqr_hash_reversed` and `fpd_specialcode`; call `storeDoc` twice per record with the same fileReference
-- [ ] For search: hash one word at a time with `tqnn_token16(word)`
+- [ ] For search: encode one word at a time (`tqnn_token16(word)` for PQR / HMAC)
 - [ ] For multi-word search: one `searchDoc` call per word, AND the result sets
 - [ ] Strip TQNN timestamp before set operations: `ref.rsplit("::", 1)[0]`
 - [ ] For FPD search: per token, also run reverse hash search and intersect before ANDing across tokens
 - [ ] Use `return_filelist=1` on `searchDoc` to get file references back
+- [ ] To change a record: `removeDoc`, then `storeDoc`
 
 ---
 
@@ -896,10 +1069,10 @@ Everything above gets you `storeDoc`/`searchDoc` file references — stable iden
 If you'd rather not build and maintain that lookup layer yourself, or you want Claude (or another MCP-compatible LLM) to call DMM directly as a tool rather than going through your own API, Toridion also ships **`dmm-mcp-server`** — an MCP server that wraps this same appliance and adds:
 
 - A **resolver layer** (`tqnn_get`) that maps a file reference's namespace prefix (e.g. `records_`, `invoices_`) to wherever that content actually lives — local file, S3, SharePoint, cold storage, or a custom handler you write — so file references resolve to real content without you hand-rolling the lookup.
-- MCP tools (`tqnn_search`, `tqnn_similarity`, `tqnn_store`, `tqnn_get`) that let Claude call DMM directly during a conversation, including IDF-weighted similarity search on top of the raw token matching this guide covers.
+- MCP tools (`tqnn_search`, `tqnn_similarity`, `tqnn_similarity_plain`, `tqnn_store`, `tqnn_get`, `tqnn_discover_datasets`, `tqnn_status`) that let Claude call DMM directly during a conversation, including IDF-weighted similarity search on top of the raw token matching this guide covers. The `hmac` option uses `TQNN_PQR_KEY` (32+ characters) from the server environment.
 - OAuth 2.1 auth for exposing DMM to claude.ai as a remote connector, with optional per-employee accounts and per-employee DMM sub-credentials.
 
-The two are complementary, not competing: `dmm-mcp-server` calls the exact same `storeDoc`/`searchDoc` endpoints documented above, using the same PQR hashing — it just adds the content-resolution and LLM-tool-calling layers on top. See the `dmm-mcp-server` repo's README and `docs/resolvers.md` for details.
+The two are complementary, not competing: `dmm-mcp-server` calls the exact same `storeDoc`/`searchDoc` endpoints documented above, using the same encoding options (Plain, PQR, HMAC) — it just adds the content-resolution and LLM-tool-calling layers on top. `removeDoc` is called directly on the REST API. See the `dmm-mcp-server` repo's README and `docs/resolvers.md` for details.
 
 ---
 
